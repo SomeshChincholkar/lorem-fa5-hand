@@ -1,0 +1,1159 @@
+================================================================================
+  DISCHARGE AI — VIVA REVISION GUIDE
+  Six agents, two MCP servers, one patient (P1019)
+================================================================================
+
+CONTENTS
+  0.  The one-paragraph answer + port map
+  1.  How the agents talk (A2A)
+  2.  Host Orchestrator          :8083   Google ADK
+  3.  Discharge Monitor          :8103   Google ADK      [ROOTS]
+  4.  Clinical Extractor         :8100   LangGraph
+  5.  Clinical Normalizer        :8102   LangGraph       [PROMPTS + RESOURCES]
+  6.  Clinical Validation        :8101   LangGraph       [ELICITATION]
+  7.  Discharge Summary Gen      :8104   Google ADK      [STREAMING]
+  8.  Clinical RAG Q&A           :8105   Agno            [STREAMING]
+  9.  RAG internals (embeddings, storage, memory, search)
+  10. The six MCP primitives — cheat sheet
+  11. Responsible-AI guardrails
+  12. Questions they will probably ask
+
+
+================================================================================
+  0.  THE ONE-PARAGRAPH ANSWER
+================================================================================
+
+If the examiner asks "what is this project?", say this:
+
+  A hospital receives discharge paperwork for each patient in three categories
+  — a doctor's report, a lab report, and a bill — in mixed formats (txt, json,
+  pdf, docx, scanned images) and mixed languages. Six autonomous agents, each a
+  separate process speaking the A2A protocol, pass the case down a pipeline:
+  find the documents, harvest their raw text, translate and structure them into
+  one discharge record, validate that record against clinical rules and a mock
+  EHR, score its risk, generate a patient-friendly discharge summary, and index
+  that summary so administrators can ask questions about it. Every capability
+  the agents use — file access, parsing, rules, reporting, analytics — lives
+  behind two MCP servers, and all six MCP primitives are exercised. A human
+  reviewer sits in the loop through a Streamlit dashboard.
+
+
+--------------------------------------------------------------------------------
+  WORKED EXAMPLE — P1019
+--------------------------------------------------------------------------------
+
+  Doctor report : doctor_reports/P1019_thomas_wright.txt
+                  English; T2DM (E11.9) + HTN (I10); NKDA;
+                  4 prescriptions (Metformin BID, Lisinopril QD,
+                  Atorvastatin QHS, Aspirin QD);
+                  one toxic line -> "Patient is non-compliant and stupid"
+
+  Lab report    : lab_reports/P1019_labs.txt
+                  Test panel with reference ranges
+
+  Bill          : bills/P1019_bill.json
+                  Line items, total, payment status
+
+P1019 is the ideal demo case: English (so translation is trivially confident),
+complete, and clean — EXCEPT for the abusive sentence in the discharge
+instructions, which lets you demonstrate the toxicity guardrail live.
+
+
+--------------------------------------------------------------------------------
+  PORT MAP
+--------------------------------------------------------------------------------
+
+  PORT   SERVICE                                          FRAMEWORK    STREAMING
+  ----   ---------------------------------------------    ----------   ---------
+  8050   Mock EHR REST API                                FastAPI      -
+  8083   Host Orchestrator (Gradio UI + A2A client)       Google ADK   client
+  8100   Clinical Extractor Agent                         LangGraph    no
+  8101   Clinical Validation Agent                        LangGraph    no
+  8102   Clinical Normalizer Agent                        LangGraph    no
+  8103   Discharge Monitor Agent                          Google ADK   no
+  8104   Discharge Summary Generator                      Google ADK   YES
+  8105   Clinical RAG Q&A Agent                           Agno         YES
+  8200   Primary Clinical Tools MCP  /clinicaltools       FastMCP      http
+  8201   Secondary Analytics MCP     /analyticstools      FastMCP      http
+  8501   Streamlit dashboard (5 pages)                    Streamlit    -
+
+
+--------------------------------------------------------------------------------
+  THE PIPELINE, IN ORDER
+--------------------------------------------------------------------------------
+
+   01              02              03              04            05           06
+  Monitor  -->  Extractor  -->  Normalizer  -->  Validator --> Summary --> RAG index
+  :8103         :8100           :8102            :8101         :8104       :8105
+  Roots         Tools           Prompts          Elicitation   stream      FAISS
+
+The model behind every LLM call is amazon.nova-lite-v1:0 on AWS Bedrock
+(us-east-1, temperature 0.2, max_tokens 5000). OFFLINE_MODE=1 bypasses every
+model call and the pipeline still completes on deterministic fallbacks — useful
+to mention if a live demo fails.
+
+
+================================================================================
+  1.  HOW THE AGENTS TALK (A2A)
+================================================================================
+
+Everything below is in core/a2a_common.py and agents/base.py. Learn this once
+and it applies to all six agents.
+
+DISCOVERY — THE AGENT CARD
+  Every agent serves its card at GET /.well-known/agent.json (and the newer
+  /.well-known/agent-card.json). Built by build_agent_card(); carries name,
+  description, URL, AgentCapabilities(streaming=..., push_notifications=True,
+  state_transition_history=True), and a list of AgentSkill objects with example
+  payloads. The orchestrator's discover_agents() fetches all six cards — that's
+  the discovery step to demo first.
+
+AUTHENTICATION
+  SharedSecretAuthMiddleware requires an X-Agent-Auth-Token header on every
+  call. Three paths stay public so an operator can discover and health-check an
+  agent without the secret: both card paths and /health.
+
+THE TWO CALL STYLES
+
+  Non-streaming : call_agent(agent, payload, trace_id)
+                  -> A2AClient.send_message() -> one final artifact
+                  Used by: Monitor, Extractor, Normalizer, Validator
+
+  Streaming     : stream_agent(agent, payload, trace_id)
+                  -> send_message_streaming() -> a sequence of
+                     TaskStatusUpdateEvents
+                  Used by: Summary Generator, RAG Q&A
+
+  Payloads are a single JSON object serialised into the message's text part.
+  Timeouts default to 900s non-streaming / 1200s streaming, because one agent
+  call can chain several throttled Bedrock requests.
+
+THE SHARED EXECUTOR
+  JsonAgentExecutor (agents/base.py) wraps every agent's plain
+  `async def handle(payload, progress)` into a compliant A2A executor. It calls
+  updater.submit() -> start_work(), runs the handler, attaches the result as an
+  artifact via add_artifact(), and calls complete(). On an exception it emits an
+  error artifact and calls failed() instead of crashing the server.
+
+  *** THE KEY IDEA ***
+  `progress` is an async callable. Awaiting it emits a TaskStatusUpdateEvent
+  with TaskState.working. THAT SINGLE MECHANISM IS WHAT "STREAMING" MEANS HERE
+  — the Summary agent calls it once per section, the RAG agent calls it per
+  pipeline stage. Non-streaming agents call it too, but their client only reads
+  the final artifact.
+
+TRACE PROPAGATION
+  One discharge case = one trace id, minted by obs.new_trace_id(patient_id).
+  It travels between agents in the A2A message metadata.trace_id (picked up by
+  trace_id_from_context()) and into the MCP server processes as the HTTP header
+  X-Discharge-Trace-Id (adopted by adopt_caller_trace()). That is why an MCP
+  tool's span lands in the same trace as the agent that called it. Spans go to
+  LangFuse when enabled and always to data/reports/traces.jsonl.
+
+
+================================================================================
+  2.  HOST ORCHESTRATOR                     :8083  Google ADK  Gradio  A2A client
+================================================================================
+
+INPUT
+  patient_id, plus five flags: allow_elicitation, generate_summary,
+  index_for_rag, reuse_extraction, reuse_record.
+
+OUTPUT
+  An async generator of progress events {"stage", "message"}, terminating in
+  {"stage": "done", "result": PipelineResult}. PipelineResult holds the record,
+  the validation verdict, the audit report, the summary markdown and the timed
+  audit trail.
+
+MCP
+  None directly. It is a pure A2A *client* — it owns no tools of its own.
+
+KEY FUNCTIONS
+  discover_agents()             fetches all six agent cards
+  run_pipeline()                the six-stage generator; the heart of the project
+  _Stage                        context manager: times a stage and appends an
+                                AuditTrailEntry (step, agent, status, detail,
+                                trace_id, duration_ms)
+  _reapply_saved_corrections()  replays a reviewer's saved HITL edits onto a
+                                freshly extracted record
+  ask_rag_streaming()           streams RAG answers into the Gradio tab
+
+WHAT IT DOES FOR P1019, STAGE BY STAGE
+  1. Mints trace obs.new_trace_id("P1019").
+  2. MONITOR (call_agent) -> "Found 3 document(s)". If none, aborts here.
+  3. EXTRACTOR — first checks reporter.load_extraction(); the cache is keyed on
+     a document fingerprint, so an unchanged P1019 skips re-harvesting entirely.
+  4. NORMALIZER — receives combined_raw_text, NOT paths. Returns the structured
+     record + translation confidence.
+  5. RE-APPLY CORRECTIONS — merges any saved reviewer edits back in.
+  6. VALIDATOR — returns risk level, completeness score, discharge_blocked, and
+     writes the audit report.
+  7. SUMMARY — GATED: only runs when reporter.approval_state(pid) == "approved".
+     Uses stream_agent and parses each event's JSON for `progress` or
+     `summary_markdown`.
+  8. RAG INDEX — call_agent("rag", {"action": "index", ...}).
+
+  >> EXAMINER BAIT: "Why is summary generation gated on approval?"
+     Because the discharge summary is the ONLY document the RAG index is built
+     from. Letting an unapproved, possibly wrong summary into the index would
+     mean administrators querying rejected clinical content. If a patient is
+     later downgraded, the orchestrator calls reporter.delete_summary() AND
+     sends the RAG agent a `deindex` action.
+
+
+================================================================================
+  3.  DISCHARGE MONITOR AGENT               :8103  Google ADK  non-streaming
+================================================================================
+
+INPUT
+  {"patient_id": "P1019", "only_new": false, "narrate": false}
+  All optional; empty scans every patient.
+
+OUTPUT
+  roots (the declared URIs), document_count, patients[] (each with
+  document_count, kinds, missing_kinds), queue, new_documents,
+  new_document_count, narrative.
+
+MCP TOOLS      clinical_watcher, verify_path_within_roots (Primary server)
+MCP ROOTS      *** THIS IS THE ROOTS AGENT *** — see below
+RESOURCES      none
+PROMPTS        none
+SAMPLING       none
+ELICITATION    none
+
+KEY FUNCTIONS
+  scan_discharge_workspace()   thin ADK wrapper over clinical_watcher
+  check_path_authorised()      thin ADK wrapper over verify_path_within_roots
+  _diff_new()                  compares against data/reports/monitor_state.json
+  build_adk_agent(), run_adk()
+
+THE ROOTS CONTRACT — EXPLAIN IT EXACTLY LIKE THIS
+  The clinical_watcher tool TAKES NO PATH ARGUMENT. Instead:
+    1. The client (this agent) opens an MCP session with list_roots_callback
+       registered.
+    2. Inside the tool, the SERVER calls `await ctx.session.list_roots()`.
+    3. The callback returns:
+         ListRootsResult(roots=[
+             Root(uri=file:///.../data/incoming,
+                  name="discharge-input-workspace")
+         ])
+    4. The server scans only inside that root; resolve_within_roots() raises
+       RootAccessDenied for anything outside it.
+
+  WHY IT MATTERS: there is no attacker-controlled path parameter to traverse in
+  the first place. verify_path_within_roots exists purely to demonstrate the
+  rejection — pass it ../../etc/passwd in the viva and it returns
+  {"allowed": false, "reason": ...}.
+
+ADK SPECIFICS
+  An LlmAgent named `discharge_monitor` is built with the two Python functions
+  above passed directly as tools=[...] — ADK derives the tool schema from the
+  docstrings and type hints. It runs through a Runner with an
+  InMemorySessionService. The LLM narration is OPTIONAL (narrate=true); the
+  deterministic scan result is what the pipeline actually consumes.
+
+
+================================================================================
+  4.  CLINICAL EXTRACTOR AGENT              :8100  LangGraph  non-streaming
+================================================================================
+
+INPUT
+  {"patient_id": "P1019"}
+
+OUTPUT
+  combined_raw_text — a dict keyed by the three categories
+    {bills, doctor_reports, lab_reports}
+  plus source_language, detected_languages, modalities, ocr_used,
+  source_documents, parse_warnings, steps.
+
+MCP TOOLS      clinical_watcher, clinical_data_harvester_tool
+ROOTS          inherited — both tools resolve paths through the declared roots
+PROMPTS        none
+SAMPLING       none
+ELICITATION    none
+  >> THIS AGENT MAKES NO LLM CALL AT ALL.
+
+KEY FUNCTIONS
+  node_discover, node_harvest, node_detect_language, build_graph(),
+  detect_language()  (in tools/parsing.py)
+
+THE LANGGRAPH
+
+    StateGraph(ExtractorState)
+
+      START -> discover --(error?)--> END
+                  |
+                  v
+               harvest --(error?)--> END
+                  |
+                  v
+           detect_language -> END
+
+    compiled with checkpointer=MemorySaver()
+    thread_id = f"extract-{patient_id}"
+
+  State is a TypedDict. The `steps` field uses Annotated[list[str], _merge] —
+  a REDUCER, so each node appends to the log instead of overwriting it. Routing
+  uses add_conditional_edges with _route_after_discover / _route_after_harvest,
+  which short-circuit to END when a node sets `error`.
+
+DESIGN POINT TO EMPHASISE — SEPARATION OF CONCERNS
+  The Extractor harvests RAW TEXT ONLY — it does zero field parsing. Multiple
+  files in one category are concatenated, not picked between. Structuring is the
+  Normalizer's job. This is why the Normalizer receives text, never file paths,
+  and why raw_text never leaves the Normalizer.
+
+LANGUAGE DETECTION
+  A dependency-free heuristic that never raises, so it needs no MCP round-trip.
+  The DOCTOR REPORT's language wins, because that document carries the
+  clinically meaningful narrative; the other categories are only a fallback.
+  For P1019 this returns "en".
+
+
+================================================================================
+  5.  CLINICAL NORMALIZER AGENT             :8102  LangGraph  non-streaming
+================================================================================
+
+INPUT
+  patient_id, combined_raw_text, source_language, detected_languages,
+  modalities, ocr_used, source_documents, parse_warnings
+  — i.e. the Extractor's whole output.
+
+OUTPUT
+  record (a validated DischargeRecord, dumped with exclude={"raw_text"}),
+  translation_confidence, below_threshold, source_language, parse_warnings,
+  steps.
+
+MCP PROMPTS    get_prompt("discharge-extraction-prompt", {"language": ...})
+MCP RESOURCES  read_resource_json("resource://medical-abbreviations")
+TOOLS          none here
+ELICITATION    none
+SAMPLING       none directly. (The sampling-based medical_lang_bridge tool is
+               the ALTERNATIVE translation path on the MCP server — see §10.)
+
+KEY FUNCTIONS
+  node_fetch_prompt, node_extract, node_assemble, node_score,
+  lang_bridge.score_confidence(), harvester.fill_gaps_from_raw_text()
+
+THE LANGGRAPH — A STRAIGHT LINE
+
+    START -> fetch_prompt -> extract -> assemble -> score -> END
+              Prompts+        LLM      Pydantic   threshold
+              Resources     (1 pass)  validation    check
+
+ONE LLM PASS DOES THREE JOBS
+  Translate to English, expand abbreviations (BID -> twice daily,
+  PO -> by mouth), and extract into the structured record — all in a single call
+  driven by the MCP prompt. The abbreviation dictionary is injected into the
+  prompt as a formatted block, so the model isn't guessing at hospital
+  shorthand.
+
+RETRY LOGIC — A GOOD DETAIL TO VOLUNTEER
+  MAX_EXTRACT_ATTEMPTS = 3. If the reply won't parse as JSON, the retry appends
+  _RETRY_INSTRUCTION AND raises the temperature (0.2 * attempt + 0.2, capped at
+  0.9). The reasoning: re-running at the same temperature on the same prompt
+  reproduces the same broken reply — nudging the sampling is what makes a retry
+  a retry rather than a repeat. But an EMPTY reply is not retried at all,
+  because that means bad credentials or a rejected request, which won't improve
+  on attempt two.
+
+THREE SAFETY NETS
+  - PROVENANCE IS NOT MODEL-OWNED. node_assemble takes clinical fields from the
+    LLM but source_documents, detected_languages etc. from the pipeline state.
+  - PYDANTIC VALIDATION FAILURE -> build a minimal DischargeRecord from
+    patient_id and log a parse warning, rather than crash.
+  - DETERMINISTIC FALLBACK — harvester.fill_gaps_from_raw_text() reads whatever
+    the LLM left blank straight off the page, so an offline or rate-limited run
+    never hands a blank record downstream.
+
+TRANSLATION CONFIDENCE
+  score_confidence(source_language, model_confidence, translated_sample,
+  combined_text) blends the model's self-reported confidence with heuristics.
+  Threshold is TRANSLATION_THRESHOLD = 0.70
+  (quality_thresholds.translation_confidence_min in rules.yaml). Below it,
+  below_threshold=True and the validator adds low_translation_confidence
+  (3 points) plus a hard HITL guardrail. For P1019 — English source —
+  confidence is ~1.0.
+
+
+================================================================================
+  6.  CLINICAL VALIDATION AGENT             :8101  LangGraph  non-streaming
+      (uses BOTH MCP servers)
+================================================================================
+
+INPUT
+  {"record": {...}, "allow_elicitation": true, "write_report": true}
+
+OUTPUT
+  record (possibly amended by elicitation), validation (ValidationResult),
+  completeness, analytics, risk_heatmap, guardrail_events, report,
+  report_files, plus the shortcuts risk_level / discharge_blocked /
+  hitl_required.
+
+MCP RESOURCES
+  resource://clinical-rules/completeness
+  resource://clinical-rules/cross-validation
+  -> fetched at RUNTIME, never imported.
+
+MCP TOOLS (primary :8200)
+  clinical_rules_engine, ehr_validation, clinical_insight_reporter
+
+MCP TOOLS (analytics :8201)
+  calculate_risk_score, get_population_benchmarks, generate_risk_heatmap
+
+MCP ELICITATION
+  *** THIS IS THE ELICITATION AGENT *** — via clinical_rules_engine
+
+KEY FUNCTIONS
+  node_load_rules, node_completeness, node_cross_validate, node_analytics,
+  node_guardrails, node_report, _icd10_codes()
+
+THE LANGGRAPH — SIX NODES, LINEAR
+
+  START -> load_rules -> completeness -> cross_validate -> analytics ->
+           Resources    Tools+Elicit      Tools            :8201
+
+        -> guardrails -> report -> END
+             RAI        Tools+Resources
+
+ELICITATION, PRECISELY
+  Inside clinical_rules_engine on the server:
+    1. rules_engine.check_completeness(record) returns a list of MissingField,
+       each marked blocking or not.
+    2. rules_engine.elicitable(missing, record) keeps the NON-BLOCKING gaps —
+       plus exactly one blocking exception: bill_settled.
+    3. build_elicitation_schema() calls Pydantic's
+       create_model("MissingClinicalFields", ...) to build a FLAT OBJECT OF
+       OPTIONAL PRIMITIVES — MCP requires flat primitive schemas.
+    4. The server calls `await ctx.elicit(message=..., schema=...)`.
+    5. The client's elicitation_callback hands it to the registered responder.
+       The Streamlit HITL page registers one via set_elicitation_responder()
+       that renders a dynamic form from requestedSchema.
+       WITH NO RESPONDER REGISTERED, THE DEFAULT IS TO DECLINE — the safe
+       answer for an unattended run.
+    6. All three outcomes are handled:
+         accept  -> apply_elicited_values() writes onto the record and
+                    completeness is re-run
+         decline -> gaps stay unresolved, case flagged for HITL
+         cancel  -> validation aborted, escalated to a senior clinician
+
+  >> WHY ONLY ONE BLOCKING FIELD IS ELICITABLE
+     A missing diagnosis or medication list must come from the documents, never
+     from someone typing into a form. An unsettled bill is a BUSINESS hold, not
+     a clinical one, and settling it is exactly the decision a human is there to
+     make. Ticking bill_settled sets payment_status = "PAID" and releases the
+     bill_settlement_check block.
+
+THE SEVEN CROSS-VALIDATION RULES
+
+  RULE ID                        SEVERITY   ACTION            RISK PTS
+  ----------------------------   --------   ---------------   --------
+  med_omission_check             Warning    flag_for_review          3
+  allergy_contradiction_check    Critical   block_discharge          8
+  diagnosis_mismatch_check       Warning    flag_for_review          4
+  follow_up_missing_check        Critical   block_discharge          2
+  lab_follow_up_mismatch_check   Warning    flag_for_review          3
+  discharge_approval_check       Critical   block_discharge          3
+  bill_settlement_check          Critical   block_discharge          5
+
+  These run in ehr_validator.cross_validate(record, ehr_record) against the
+  Mock EHR at :8050.
+
+RISK SCORING
+  compute_risk() sums weights into a `breakdown` dict; classify_risk() bands it:
+      <= 2   LOW
+      <= 8   MEDIUM
+       > 8   HIGH
+  Then:
+    discharge_blocked = a blocking field is missing OR a Critical rule with
+                        action=block_discharge failed
+    hitl_required     = blocked OR not Low OR any hard guardrail hit
+    recommendation    = APPROVE / EDIT / REJECT
+
+  >> SUBTLE DISTINCTION WORTH STATING
+     hitl_hard_guardrails is a REVIEW trigger, not a release block. A shaky
+     translation must reach a human, but it is not the same category of event
+     as prescribing a drug the patient is allergic to. Conflating the two would
+     block clean cases on model jitter.
+
+THE SECOND MCP SERVER
+  node_analytics opens a client with connect_primary_server=False and calls
+  three tools on :8201 — a composite 0-100 score with a band and top drivers,
+  ICD-10-based 30-day readmission benchmarks versus the peer median, and a
+  risk-contribution heatmap. Failure here is non-fatal: it logs and returns
+  {"error": ...}, and validation continues.
+
+GUARDRAILS NODE
+  Runs the TOXICITY FILTER over discharge_instructions (this is where P1019's
+  "non-compliant and stupid" line is rewritten) and calls escalate_if_needed(),
+  which forces hitl_required=True on High risk or a blocked discharge.
+
+REPORTING
+  clinical_insight_reporter renders the audit report to JSON + HTML + PDF in
+  data/reports/<PID>/, stamped with rules_version — the SHA-256 of rules.yaml,
+  truncated to 16 chars, for compliance reproducibility.
+
+
+================================================================================
+  7.  DISCHARGE SUMMARY GENERATOR           :8104  Google ADK  *** STREAMING ***
+================================================================================
+
+INPUT
+  {"patient_id", "record", "risk_level", "audience"}
+  If only patient_id is given it loads the stored record via
+  reporter.load_record().
+
+OUTPUT
+  summary_markdown, sections (dict), section_order, files (md/html/pdf),
+  risk_level, audience, guardrail_events.
+
+MCP PROMPTS    get_prompt("summary-generation-prompt",
+                          {"risk_level", "audience"})
+               -> fetched, never hardcoded
+TOOLS          none
+RESOURCES      none
+ELICITATION    none
+SAMPLING       none
+
+KEY FUNCTIONS
+  generate_sections(), render_section(), _stream_adk(), _hitl_note(),
+  reporter.write_summary()
+
+THE FIVE SECTIONS, STREAMED IN THIS ORDER
+  01  Patient & Stay          (patient)
+  02  Your Medicines          (medications)
+  03  Your Test Results       (labs)
+  04  Your Bill               (bill)
+  05  What To Do Next         (instructions)
+
+THE DRAFT-THEN-REWRITE PATTERN — THE BEST DESIGN DECISION TO TALK ABOUT
+  For each section, render_section() first builds a DETERMINISTIC, FACTUALLY
+  CORRECT markdown draft straight from the DischargeRecord — the medication
+  table, the lab table with reference ranges, the bill line items. That draft is
+  then handed to the ADK LlmAgent with the instruction:
+
+    "rewrite it in clear plain English, keeping every number, drug name, dose
+     and date exactly as given. Do not add facts."
+
+  >> WHY THIS IS RIGHT
+     The model never invents clinical content — it only rephrases content that
+     was already derived from the record. And if the LLM call fails, or
+     OFFLINE_MODE=1, the deterministic draft IS the output. The pipeline always
+     produces a complete, accurate summary; the only thing that degrades is the
+     prose.
+
+HOW THE STREAMING ACTUALLY WORKS
+  After each section is generated it is passed through
+  manager.filter_clinical_text() (toxicity) and then `await progress(safe)` —
+  pushing that section to the client as a TaskStatusUpdateEvent. The
+  orchestrator/dashboard renders it immediately, before the remaining sections
+  exist. Each section uses its own ADK session id (summary-{pid}-{key}) so
+  sections don't contaminate each other.
+
+TWO EXTRA BEHAVIOURS
+  - _hitl_note() appends a "Reviewer-confirmed details" block. Reason: the
+    summary is the only source the RAG index is built from, so anything a
+    reviewer supplied must appear unambiguously in this text or RAG can never
+    answer questions about it.
+  - If risk_level == "High", a safety notice is prepended and section 5 gains a
+    "pending clinician review" warning.
+
+
+================================================================================
+  8.  CLINICAL RAG Q&A AGENT                :8105  Agno  *** STREAMING ***
+================================================================================
+
+INPUT
+  An `action`: ask (default) | index | deindex | tools | stats
+  For ask: question, optional patient_id, session_id, top_k
+
+OUTPUT (ask)
+  answer, patient_filter, prompt_injection_detected, triad,
+  sources[] (doc_id, patient_id, kind, score, rerank_score, excerpt,
+             source_path),
+  guardrail_events, session_id
+
+MCP
+  MultiMCPTools across BOTH servers at once, plus
+  get_prompt("rag-answer-prompt", {"context_length"})
+
+KEY CLASSES
+  IndexingAgent, RetrievalAgent, AugmentationAgent, GenerationAgent,
+  ReflectionAgent — orchestrated by AgenticRAG.ask()
+
+MULTIMCPTOOLS
+
+    MultiMCPTools(
+        urls=[primary_url, analytics_url],
+        urls_transports=["streamable-http", "streamable-http"],
+        timeout_seconds=60,
+        allow_partial_failure=True,
+        header_provider=lambda: {"X-Agent-Auth-Token": settings.a2a_auth_token},
+    )
+
+  One toolkit, two endpoints, every tool from both servers available to the
+  model. Call the agent with {"action": "tools"} in the viva to prove the
+  multi-server connection is live — it returns the merged tool list.
+
+
+================================================================================
+  9.  RAG INTERNALS — THE DEEP-DIVE ANSWERS
+================================================================================
+
+--------------------------------------------------------------------------------
+  THE FIVE ROLES
+--------------------------------------------------------------------------------
+  1  IndexingAgent       Chunks each approved patient's discharge summary and
+                         writes it into that patient's own FAISS index
+  2  RetrievalAgent      Embeds the question, searches FAISS, returns top-k
+                         with cosine scores
+  3  AugmentationAgent   Re-ranks hits with a lexical signal, then builds the
+                         citable context block
+  4  GenerationAgent     agno.Agent — generates the grounded answer using the
+                         MCP prompt
+  5  ReflectionAgent     Scores the RAG Triad
+
+
+--------------------------------------------------------------------------------
+  WHAT GETS INDEXED — AND WHAT DELIBERATELY DOES NOT
+--------------------------------------------------------------------------------
+  ONLY THE GENERATED DISCHARGE SUMMARY. The raw source documents are NOT
+  indexed. Three reasons, all worth saying aloud:
+    - They are pre-translation — a Dutch document can't answer an English
+      question.
+    - They are pre-validation — they may carry information a reviewer rejected.
+    - The summary is the vetted, English, patient-facing document.
+
+  And the approval gate is enforced INSIDE IndexingAgent.index_patient(), not
+  only by its callers, so the invariant holds no matter which code path triggers
+  indexing.
+
+
+--------------------------------------------------------------------------------
+  CHUNKING — SEMANTIC, NOT A SLIDING WINDOW
+--------------------------------------------------------------------------------
+  chunk_markdown_semantic() splits the summary along its own "##" headings, so
+  each of the five sections becomes exactly one chunk. A section is only
+  sub-split — via the generic chunk_text() window — if it alone exceeds
+  chunk_size, and that split never crosses a section boundary.
+
+    chunk_size    = 900 characters
+    chunk_overlap = 150 characters
+
+  - Text before the first heading (the safety notice) is folded into the first
+    section, not dropped.
+  - Chunk ids look like:  P1019_summary_your_medicines#0
+
+  WHY NOT A PLAIN SLIDING WINDOW?
+  Because a window knows nothing about structure — it would split the medication
+  table away from its header, or blend the bill into the lab results.
+  Heading-aware chunking keeps each chunk on one topic.
+
+
+--------------------------------------------------------------------------------
+  EMBEDDINGS — THE MODEL AND THE VECTOR LENGTH
+--------------------------------------------------------------------------------
+
+  PROVIDER                MODEL                          DIMENSIONS  WHEN
+  ---------------------   ----------------------------   ----------  -----------
+  bedrock  (DEFAULT)      cohere.embed-english-v3              1024  normal
+  sentence_transformers   all-MiniLM-L6-v2                      384  local/torch
+  hash                    blake2b bag-of-hashed-tokens          384  offline/CI
+
+  >> SO: THE VECTOR LENGTH IS 1024 in the default configuration.
+
+  Every provider returns L2-NORMALISED FLOAT32 vectors — that normalisation is
+  the whole trick behind the search method below.
+
+  The Bedrock embedder batches 16 texts per request with 3 attempts and
+  exponential backoff. If it must give up it LATCHES permanently to the hash
+  embedder for the rest of the process and re-embeds the whole list, because
+  vectors from two different embedding functions are not comparable — a
+  half-Bedrock, half-hash index would return nonsense. The embedder's `name`
+  changes to "bedrock-hash-fallback", and that name is written into the index
+  metadata.
+
+
+--------------------------------------------------------------------------------
+  HOW EMBEDDINGS ARE STORED
+--------------------------------------------------------------------------------
+
+    data/vector_db/
+      +-- P1019/
+      |     +-- discharge.faiss        <- the FAISS index (the vectors)
+      |     +-- discharge_meta.json    <- {dimension, embedder, chunks[]}
+      +-- P1021/
+      |     +-- discharge.faiss
+      |     +-- discharge_meta.json
+      +-- ...
+
+  ONE FAISS INDEX PER PATIENT, not one shared index filtered after the fact.
+  The index type is faiss.IndexFlatIP(dimension) — a flat (exhaustive,
+  brute-force) index over inner product. The chunk TEXT and metadata live
+  alongside in the JSON sidecar; FAISS itself stores only vectors, and a search
+  result's row position indexes back into meta["chunks"].
+
+  Two robustness details:
+    - _load() compares meta["embedder"] against the currently configured
+      embedder. A mismatch means the index is meaningless, so it is rebuilt on
+      the next add().
+    - _refresh_if_stale() compares the sidecar's mtime on every read. That is
+      how the Streamlit process picks up an index written by the separate RAG
+      agent process.
+
+  Re-indexing uses replace_patient(), a FULL REBUILD — not an incremental add —
+  because a patient's index has exactly one logical source, so re-indexing must
+  never leave behind chunks from a previous run.
+
+
+--------------------------------------------------------------------------------
+  WHICH MEMORY — LONG-TERM OR SHORT-TERM?
+--------------------------------------------------------------------------------
+
+  >> ANSWER: BOTH, AND THEY ARE DIFFERENT THINGS.
+
+  LONG-TERM MEMORY  = the FAISS vector store — persisted to disk, survives
+                      restarts, holds the clinical knowledge.
+  SHORT-TERM MEMORY = the Agno conversational session — the last 3 turns, so a
+                      follow-up like "and his bill?" resolves against the
+                      previous question.
+
+  The short-term memory is configured on the agno.Agent:
+
+    Agent(
+        name="Clinical RAG Generation Agent",
+        model=AwsBedrock(id="amazon.nova-lite-v1:0", ...),
+        db=SqliteDb(db_file="data/sessions/rag_sessions.db"),
+        session_id=session_id,
+        add_history_to_context=True,
+        num_history_runs=3,          # <- "last 3 turns as context"
+        markdown=True,
+    )
+
+  Note the nuance: the session history is SHORT-TERM IN SCOPE (3 turns) but
+  PERSISTED in SQLite, so a conversation survives a restart. The default
+  session_id is  rag-{patient_id or 'all'}.
+
+  Separately, the LangGraph agents (Extractor, Normalizer, Validator) each
+  compile with checkpointer=MemorySaver() — in-process, per-thread_id graph
+  checkpointing. That is short-term WORKING memory for a single graph run, not
+  conversational memory.
+
+
+--------------------------------------------------------------------------------
+  IS IT SIMILARITY SEARCH? HOW EXACTLY?
+--------------------------------------------------------------------------------
+
+  >> YES — COSINE SIMILARITY, COMPUTED AS AN INNER PRODUCT.
+
+  The chain of reasoning:
+    1. Every vector is L2-normalised at embedding time (_normalise() divides
+       each row by its norm).
+    2. For unit vectors, a . b = cos(theta). So inner product IS cosine
+       similarity.
+    3. The index is IndexFlatIP — Flat = exhaustive brute-force (no IVF/HNSW
+       approximation), IP = inner product.
+
+  Because every per-patient index uses the same normalisation and the same
+  metric, SCORES ARE DIRECTLY COMPARABLE ACROSS INDICES — which is exactly what
+  makes the "all patients" merge valid.
+
+
+  THE FULL SEARCH PATH FOR A QUERY
+  --------------------------------
+   1. PROMPT-INJECTION GUARD — guard_user_query() can reject or sanitise before
+      anything else runs.
+   2. PII REDACTION OF THE QUESTION — done BEFORE retrieval, so the raw question
+      never reaches a span, a trace or the prompt.
+   3. AUTO-SCOPING — _named_patient() regexes for P\d{4}. If the question names
+      exactly one indexed patient, the query is scoped to them even when the UI
+      filter says "all patients". Two different ids means a comparison question
+      and is NOT narrowed.
+   4. EMBED THE QUERY — embedder.embed_one(query), normalised, reshaped to
+      (1, d), cast to float32.
+   5. FAISS SEARCH — with a patient filter, only that patient's index. Without
+      one, every persisted index is searched and the hits are merged and
+      re-sorted by score, then truncated to top_k. Default top_k = 5.
+   6. RE-RANK (HYBRID) — see the formula below.
+   7. RELEVANCE FLOOR — if the best re-ranked score is below
+      min_relevance = 0.12, the agent returns the mandated refusal WITHOUT
+      SPENDING A GENERATION CALL. This is what makes "what is the capital of
+      Australia?" answer correctly instead of hallucinating.
+   8. BUILD CONTEXT — build_context() concatenates chunks under
+      [doc_id] (kind, patient ...) markers, budgeted to 9000 characters.
+   9. GENERATE — Agno `await agent.arun(prompt)` with the MCP-fetched prompt.
+  10. TOXICITY FILTER -> PII REDACTION -> GROUNDING CHECK -> REFLECTION.
+
+
+  THE RE-RANKING FORMULA — QUOTE THIS IF ASKED
+  --------------------------------------------
+    coverage = (distinct question terms present in chunk)
+               / (distinct question terms)
+
+    density  = log1p(weighted term occurrences)
+               / log1p(max(2, 3 * n_terms))
+
+    lexical  = 0.65 * coverage + 0.35 * min(1.0, density)
+
+    rerank_score = 0.55 * cosine_score + 0.45 * lexical
+                                        ^ lexical_weight = 0.45
+
+  So it is a HYBRID ranker: dense embedding similarity plus a sparse lexical
+  signal. The density term is log-damped so a long chunk full of repeated words
+  can't win on volume alone. Stopwords are stripped and tokens must be > 2
+  characters.
+
+
+  THE RAG TRIAD
+  -------------
+    METRIC              MEASURES                                    THRESHOLD
+    -----------------   -----------------------------------------   ---------
+    Faithfulness        Every claim in the answer is supported by    >= 0.70
+                        the context
+    Answer relevance    The answer addresses the question            reported
+    Context relevance   The context relates to the question          reported
+
+  Scoring is LLM-AS-JUDGE (_JUDGE_PROMPT, temperature 0.0, JSON-only) with a
+  deterministic LEXICAL TOKEN-OVERLAP FALLBACK when offline or when the judge is
+  unavailable. If faithfulness falls below faithfulness_min = 0.70,
+  check_grounding() blocks the answer and substitutes the refusal. An answer
+  that starts with "I don't know" is scored 1.0 faithfulness by construction —
+  an honest refusal is perfectly grounded.
+
+
+  THE MANDATED REFUSAL STRING
+  ---------------------------
+    "I don't know - this information is not available in the patient records."
+    (with an em-dash in the actual source)
+
+  It is returned from three independent places: no context retrieved, best
+  relevance below the floor, and the hallucination guardrail blocking an
+  ungrounded answer.
+
+
+  THE OFFLINE / FALLBACK ANSWER PATH
+  ----------------------------------
+  _extractive_answer() scores whole retrieved PASSAGES (not individual lines)
+  against a synonym-expanded term set — medications -> prescription, medicine,
+  drug, tablet, dose, mg — then quotes the best passage verbatim with its
+  citation. Grounded by construction, since it never generates anything.
+
+  >> A BUG WORTH MENTIONING AS A DESIGN DECISION
+     Agno does NOT raise on a provider error — it returns a RunOutput with
+     status=ERROR whose `content` is the raw provider error message. Returning
+     that as an answer would render an HTTP error as clinical advice, so
+     generate() checks the status explicitly and falls back to extraction.
+
+
+================================================================================
+  10.  THE SIX MCP PRIMITIVES — CHEAT SHEET
+================================================================================
+
+If you learn one table for the viva, learn this one.
+
+  PRIMITIVE      WHERE IT LIVES                                WHO USES IT
+  -----------    ------------------------------------------    ----------------
+  Tools          9 on Primary :8200, 4 on Analytics :8201      All agents
+  Resources      6 on Primary (@mcp.resource)                  Normalizer,
+                                                               Validator
+  Prompts        5 on Primary (@mcp.prompt)                    Normalizer,
+                                                               Summary, RAG
+  Sampling       medical_lang_bridge ->                        Server asks,
+                 ctx.session.create_message()                  client's LLM
+                                                               answers
+  Elicitation    clinical_rules_engine -> ctx.elicit()         Validator ->
+                                                               HITL dashboard
+  Roots          clinical_watcher ->                           Monitor,
+                 ctx.session.list_roots()                      Extractor
+
+
+--------------------------------------------------------------------------------
+  PRIMARY SERVER — THE 9 TOOLS
+--------------------------------------------------------------------------------
+  TOOL                            PURPOSE                      PRIMITIVE SHOWN
+  ----------------------------    -------------------------    -----------------
+  clinical_watcher                Find documents               Tools + ROOTS
+  verify_path_within_roots        Path-traversal demo          Roots
+  clinical_data_harvester         Parse to structured record   Tools
+  clinical_data_harvester_tool    Raw text only, per category  Tools
+  medical_lang_bridge             Translate + normalise abbr   Tools + SAMPLING
+  clinical_rules_engine           Completeness validation      Tools + ELICITATION
+  ehr_validation                  The 7 cross-validation rules Tools
+  clinical_insight_reporter       JSON/HTML/PDF audit report   Tools + Resources
+  server_capabilities             Self-description             Tools
+
+
+--------------------------------------------------------------------------------
+  THE 6 RESOURCES
+--------------------------------------------------------------------------------
+  resource://clinical-rules/completeness
+  resource://clinical-rules/cross-validation
+  resource://medical-abbreviations
+  resource://report-template/html
+  resource://discharge-report/{patient_id}      (templated)
+  resource://lab-report/{patient_id}            (templated)
+
+  Templated resources are URI-parameterised by PATIENT ID, NEVER BY PATH — so
+  the only reachable documents are the ones the watcher finds for that id inside
+  the declared root.
+
+--------------------------------------------------------------------------------
+  THE 5 PROMPTS
+--------------------------------------------------------------------------------
+  discharge-extraction-prompt          (Normalizer)
+  ehr-cross-validation-prompt
+  abbreviation-normalization-prompt    (medical_lang_bridge)
+  summary-generation-prompt            (Summary Generator)
+  rag-answer-prompt                    (RAG Generation Agent)
+
+
+--------------------------------------------------------------------------------
+  SAMPLING — THE EXACT PARAMETERS
+--------------------------------------------------------------------------------
+  The direction is the point: THE SERVER REQUESTS INFERENCE, THE CLIENT PERFORMS
+  IT. The MCP server needs no API key, no model binding and no credentials of
+  its own.
+
+  WHAT THE SERVER SENDS:
+
+    await ctx.session.create_message(
+        messages=[SamplingMessage(role="user",
+                  content=TextContent(type="text", text=prompt))],
+        max_tokens=4096,
+        temperature=0.0,
+        system_prompt="You are a certified medical translator. "
+                      "Reply with JSON only.",
+        model_preferences=ModelPreferences(
+            hints=[ModelHint(name=hint)],   # "nova-lite" or "command-r-plus"
+            intelligencePriority=0.8 if hint == "nova-lite" else 0.5,
+            speedPriority=0.4,
+            costPriority=0.6,
+        ),
+        metadata={"tool": "medical_lang_bridge",
+                  "source_language": source_language},
+    )
+
+  WHAT THE CLIENT RETURNS:
+
+    CreateMessageResult(
+        role="assistant",
+        content=TextContent(type="text", text=text),
+        model=model,              # the model the client ACTUALLY chose
+        stopReason="endTurn",
+    )
+
+  The client's sampling_callback reads params.modelPreferences.hints and
+  resolves them through mcp_sampling.hint_routing in agent_config.yaml — so a
+  server asking for "nova-lite" or "command-r-plus" maps to a concrete Bedrock
+  id with no code change. If the completion is empty it returns
+  ErrorData(code=-32000, ...), which lets the server fall back cleanly instead
+  of treating an empty string as a valid translation. The server then degrades
+  to lang_bridge.offline_translation().
+
+  Notice the observability shape: the server records its HINT, and the span
+  records the model the client ACTUALLY RAN. Those two being different is the
+  whole point of the primitive.
+
+
+--------------------------------------------------------------------------------
+  ROOTS — THE EXACT CALLBACK
+--------------------------------------------------------------------------------
+    async def list_roots_callback(context) -> ListRootsResult:
+        root_path = settings.paths.input_root          # data/incoming
+        return ListRootsResult(roots=[
+            Root(uri=FileUrl(root_path.as_uri()),
+                 name="discharge-input-workspace")
+        ])
+
+--------------------------------------------------------------------------------
+  ELICITATION — THE EXACT CALLBACK CONTRACT
+--------------------------------------------------------------------------------
+    Responder signature:
+        __call__(message: str, requested_schema: dict)
+            -> tuple[action, values]         action in {accept, decline, cancel}
+
+    Returns ElicitResult(action="accept", content=values) on accept,
+    ElicitResult(action=action) otherwise.
+    Unknown action -> coerced to "decline".
+    Responder raised -> ErrorData(code=-32000, ...).
+
+
+================================================================================
+  11.  RESPONSIBLE-AI GUARDRAILS
+================================================================================
+
+All five run through one GuardrailManager; each fires a GuardrailEvent that is
+written to the trace as an intervention span and attached to the audit report.
+
+  GUARDRAIL                 TRIGGER                        ACTION       RUNS IN
+  -----------------------   ----------------------------   ----------   --------
+  PIIRedactor               Phone, Aadhaar, PAN, SSN,      filter       RAG in
+                            MRN, email, street address     (mask)       & out
+  PromptInjectionGuard      "ignore previous               block or     RAG query
+                            instructions", role overrides  sanitise
+  ToxicityFilter            Abusive / demeaning text       rewrite or   Validator
+                                                           remove       + every
+                                                                        summary
+                                                                        section
+  HallucinationChecker      faithfulness < 0.70            block &      RAG answer
+                                                           substitute
+                                                           refusal
+  escalate_if_needed()      High risk or blocked           escalate     Validator
+                            discharge                      to HITL
+
+  >> LIVE DEMO LINE FOR P1019
+     The doctor report contains "Patient is non-compliant and stupid". Show the
+     audit report's guardrail events: ToxicityFilter triggered, phrase rewritten
+     before the patient-facing summary was written. It is the cleanest one-line
+     proof that the guardrails actually run.
+
+TWO SUBTLETIES WORTH VOLUNTEERING
+  - THE PATIENT'S OWN NAME IS DELIBERATELY NEVER REDACTED IN RAG ANSWERS. The
+    GuardrailManager there is constructed with no patient_names, so name
+    redaction never fires — a clinical answer has to be able to say who it is
+    about.
+  - PII REDACTION OF A RAG QUESTION HAPPENS BEFORE RETRIEVAL, not after
+    generation. Masking only the final answer was too late: the raw question had
+    already been logged to LangFuse via the retrieval and generation spans, and
+    baked into the prompt sent to the model.
+
+
+================================================================================
+  12.  QUESTIONS THEY WILL PROBABLY ASK
+================================================================================
+
+Q: Why six separate agents instead of one program?
+A: Each is an independently deployable A2A service with its own agent card,
+   port, framework and failure domain. They are heterogeneous on purpose —
+   LangGraph where the work is a deterministic state machine with branching
+   (extract, normalise, validate), ADK where the work is LLM-driven narration or
+   generation (monitor, summary), Agno where the work is agentic RAG with
+   session memory. The orchestrator only knows their cards and payload
+   contracts, so any one of them can be swapped or scaled without touching the
+   others.
+
+Q: Why is the Extractor separate from the Normalizer? Isn't that one job?
+A: They fail differently and cost differently. Harvesting is I/O — parsing, OCR,
+   encoding — and is deterministic and cacheable. Normalising is a paid,
+   non-deterministic LLM call. Splitting them means the harvest can be cached on
+   a document fingerprint and reused, so pressing "Process" twice on unchanged
+   documents does not pay for extraction again. It also means raw text never
+   travels past the Normalizer.
+
+Q: What happens if the LLM is unavailable?
+A: Every LLM-dependent stage has a deterministic path.
+     Normalizer -> harvester.fill_gaps_from_raw_text() reads fields off the page
+     Summary    -> render_section() emits the factually correct draft
+     RAG        -> _extractive_answer() quotes the best passage verbatim
+     Embeddings -> the hash embedder
+     Triad      -> lexical token overlap
+   Set OFFLINE_MODE=1 and the whole pipeline still runs end to end; only the
+   prose quality degrades.
+
+Q: How do you stop the RAG agent answering about the wrong patient?
+A: Three layers. First, physical isolation — one FAISS index per patient
+   directory, so a filtered query never even reads another patient's vectors.
+   Second, auto-scoping — _named_patient() detects a P\d{4} in the question and
+   scopes to it even when the UI filter says "all patients"; answering "what
+   medications was P1019 discharged on?" with P1021's list is the one failure
+   mode this system must never have. Third, two ids in one question means a
+   comparison and is deliberately NOT narrowed.
+
+Q: Why FAISS IndexFlatIP and not IVF or HNSW?
+A: Because the corpus is tiny — five chunks per patient. Approximate indices
+   trade recall for speed on millions of vectors; here a brute-force scan is
+   exact and instantaneous, and there is no build/train step to get wrong.
+   IndexFlatIP over L2-normalised vectors also gives exact cosine similarity,
+   which is what makes scores comparable across per-patient indices when merging
+   an "all patients" search.
+
+Q: Which agents stream and why those two?
+A: The Summary Generator (:8104) and the RAG Q&A agent (:8105). Both produce
+   long-form text a human is waiting to read, so progressive delivery is a real
+   UX gain — the summary arrives section by section, the RAG answer with its
+   retrieval progress. The four pipeline agents return one structured verdict
+   each; streaming a JSON record would be pointless. The card's
+   capabilities.streaming flag advertises which is which.
+
+Q: Show me sampling versus a normal tool call.
+A: A normal tool call runs ON THE SERVER — the client sends arguments, the
+   server computes and returns. Sampling inverts it: the server has a prompt but
+   no model access, so it calls ctx.session.create_message() and the CLIENT runs
+   inference on its own credentials and returns a CreateMessageResult. That is
+   why medical_lang_bridge can translate without the MCP server holding a single
+   AWS key. The server expresses a preference via ModelHint; the client decides
+   which model actually runs, and the result names it.
+
+Q: What are the three elicitation outcomes and what does each do?
+A: accept  -> apply_elicited_values() writes the reviewer's values onto the
+              record, records them in hitl_corrections, and completeness is
+              re-run.
+   decline -> the gaps stay unresolved and the case is flagged for HITL; an
+              unsettled bill keeps the discharge blocked.
+   cancel  -> validation is aborted and escalated to a senior clinician.
+   There is also a fourth path — if elicitation is unavailable entirely, the
+   exception handler treats it as declined, which is the safe default.
+
+Q: What makes this "agentic" RAG rather than plain RAG?
+A: Plain RAG is retrieve -> stuff -> generate. Here five distinct roles each
+   make a decision: Indexing decides WHAT IS ELIGIBLE to be indexed (approved
+   summaries only), Retrieval decides scope, Augmentation re-ranks and can
+   reorder what the embedder preferred, Generation is an agno.Agent with tools
+   and session memory rather than a bare completion, and Reflection scores its
+   own output and can cause it to be blocked. There is also a pre-generation
+   refusal — below min_relevance the system declines without calling the model
+   at all.
+
+Q: Where is the human in the loop?
+A: Four places. (1) MCP Elicitation — the server asks for missing fields
+   mid-validation and the dashboard renders a form from the schema. (2) The HITL
+   Corrections page — editing the medications table directly. (3) The
+   approve/reject decision, which reporter.approval_state() treats as always
+   winning over the automated recommendation. (4) The gate itself — no summary
+   and no RAG index entry exists until a patient is approved, and downgrading a
+   patient deletes both.
+
+Q: How is the system auditable?
+A: One trace id per discharge case, propagated through A2A message metadata and
+   into MCP server processes via the X-Discharge-Trace-Id header, so agent spans
+   and tool spans land in the same trace. Every pipeline stage is timed into an
+   AuditTrailEntry. Every guardrail firing is an event on the report. Every
+   elicitation records the schema sent, the reviewer's response and the action
+   taken. And each report stamps rules_version — the SHA-256 of rules.yaml — so
+   you can prove which rule set produced a given verdict.
+
+Q: What would you improve given more time?
+A: Honest answers land better than defensive ones: the FAISS rebuild-on-write is
+   O(n) per patient and would not scale past a small corpus; the lexical
+   re-ranker is hand-tuned rather than learned; the LLM-as-judge triad scores
+   with the same model family that generated the answer, which is a known bias;
+   and there are no integration tests across the full six-agent path — only unit
+   tests plus a smoke test.
+
+
+================================================================================
+  QUICK-REFERENCE NUMBERS (memorise these)
+================================================================================
+
+  LLM model                     amazon.nova-lite-v1:0  (Bedrock, us-east-1)
+  LLM temperature / max_tokens  0.2 / 5000
+  Embedding model               cohere.embed-english-v3
+  Embedding dimensions          1024   (MiniLM fallback 384, hash 384)
+  FAISS index type              IndexFlatIP  (exact, inner product = cosine)
+  chunk_size / chunk_overlap    900 / 150 characters
+  top_k                         5
+  lexical_weight (re-rank)      0.45   -> 0.55*cosine + 0.45*lexical
+  min_relevance (refuse below)  0.12
+  faithfulness_min              0.70
+  translation_confidence_min    0.70
+  Agno history turns            3      (num_history_runs)
+  Risk bands                    Low <= 2, Medium <= 8, High > 8
+  Cross-validation rules        7
+  MCP primitives                6      (all demonstrated)
+  Primary MCP tools/res/prompts 9 / 6 / 5
+  Analytics MCP tools           4
+  A2A timeouts                  900s non-streaming, 1200s streaming
+
+================================================================================
+  End of guide.
+================================================================================
